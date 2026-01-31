@@ -29,3 +29,73 @@ client.recreate_collection(
 
 class Question(BaseModel):
     question: str
+
+@app.post("/ingest/pdf")
+async def ingest_pdf(file: UploadFile = File(...)):
+    reader = PdfReader(file.file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=700,
+        chunk_overlap=100
+    )
+    chunks = splitter.split_text(text)
+
+    points = []
+    for chunk in chunks:
+        vector = model.encode(chunk).tolist()
+        points.append({
+            "id": str(uuid.uuid4()),
+            "vector": vector,
+            "payload": {"text": chunk, "source": file.filename}
+        })
+
+    client.upsert(
+        collection_name=COLLECTION,
+        points=points
+    )
+
+    return {"status": "PDF ingested", "chunks": len(points)}
+
+@app.post("/query")
+def query_rag(q: Question):
+    query_vector = model.encode(q.question).tolist()
+
+    search = client.search(
+        collection_name=COLLECTION,
+        query_vector=query_vector,
+        limit=5
+    )
+
+    context = "\n".join([hit.payload["text"] for hit in search])
+
+    prompt = f"""
+    Réponds à la question en utilisant le contexte ci-dessous.
+
+    CONTEXTE:
+    {context}
+
+    QUESTION:
+    {q.question}
+    """
+
+    response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": "llama3-8b-8192",
+            "messages": [{"role": "user", "content": prompt}]
+        }
+    )
+
+    answer = response.json()["choices"][0]["message"]["content"]
+
+    return {
+        "answer": answer,
+        "sources": list(set([hit.payload["source"] for hit in search]))
+    }
