@@ -2,7 +2,6 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import VectorParams, Distance
-from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 import uuid
@@ -10,7 +9,7 @@ import os
 import requests
 
 # ------------------ APP ------------------
-app = FastAPI(title="RAG Server")
+app = FastAPI(title="RAG Server (API Embeddings)")
 
 # ------------------ ENV ------------------
 QDRANT_URL = os.getenv("QDRANT_URL")
@@ -18,7 +17,7 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not all([QDRANT_URL, QDRANT_API_KEY, GROQ_API_KEY]):
-    raise RuntimeError("❌ Missing environment variables")
+    raise RuntimeError("Missing environment variables")
 
 # ------------------ QDRANT ------------------
 COLLECTION = "rag_docs"
@@ -29,26 +28,37 @@ client = QdrantClient(
     timeout=30
 )
 
-# Create collection ONLY if not exists
+# Create collection once
 if not client.collection_exists(COLLECTION):
     client.create_collection(
         collection_name=COLLECTION,
         vectors_config=VectorParams(
-            size=384,
+            size=1536,   # embedding size (IMPORTANT)
             distance=Distance.COSINE
         )
     )
 
-# ------------------ MODEL (LAZY LOAD) ------------------
-_model = None
+# ------------------ EMBEDDING VIA API ------------------
+def embed_text(text: str) -> list:
+    response = requests.post(
+        "https://api.groq.com/openai/v1/embeddings",
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": "text-embedding-3-small",
+            "input": text
+        },
+        timeout=30
+    )
 
-def get_model():
-    global _model
-    if _model is None:
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
-    return _model
+    if response.status_code != 200:
+        raise HTTPException(500, "Embedding API error")
 
-# ------------------ SCHEMAS ------------------
+    return response.json()["data"][0]["embedding"]
+
+# ------------------ SCHEMA ------------------
 class Question(BaseModel):
     question: str
 
@@ -61,30 +71,29 @@ def health():
 @app.post("/ingest/pdf")
 async def ingest_pdf(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files allowed")
+        raise HTTPException(400, "Only PDF allowed")
 
     reader = PdfReader(file.file)
-    full_text = ""
+    text = ""
 
     for page in reader.pages:
-        text = page.extract_text()
-        if text:
-            full_text += text
+        page_text = page.extract_text()
+        if page_text:
+            text += page_text
 
-    if not full_text.strip():
-        raise HTTPException(status_code=400, detail="Empty PDF")
+    if not text.strip():
+        raise HTTPException(400, "Empty PDF")
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=700,
         chunk_overlap=100
     )
 
-    chunks = splitter.split_text(full_text)
-    model = get_model()
+    chunks = splitter.split_text(text)
 
     points = []
     for chunk in chunks:
-        vector = model.encode(chunk).tolist()
+        vector = embed_text(chunk)
         points.append({
             "id": str(uuid.uuid4()),
             "vector": vector,
@@ -100,15 +109,14 @@ async def ingest_pdf(file: UploadFile = File(...)):
     )
 
     return {
-        "status": "PDF ingested successfully",
+        "status": "PDF ingested",
         "chunks": len(points)
     }
 
 # ------------------ QUERY ------------------
 @app.post("/query")
 def query_rag(q: Question):
-    model = get_model()
-    query_vector = model.encode(q.question).tolist()
+    query_vector = embed_text(q.question)
 
     results = client.search(
         collection_name=COLLECTION,
@@ -118,7 +126,7 @@ def query_rag(q: Question):
 
     if not results:
         return {
-            "answer": "Aucun document trouvé. Veuillez uploader un PDF.",
+            "answer": "Aucun document trouvé. Uploadez un PDF.",
             "sources": []
         }
 
@@ -149,7 +157,7 @@ QUESTION:
     )
 
     if response.status_code != 200:
-        raise HTTPException(status_code=500, detail="LLM error")
+        raise HTTPException(500, "LLM error")
 
     answer = response.json()["choices"][0]["message"]["content"]
 
