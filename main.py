@@ -94,7 +94,7 @@ def query_rag(q: Question):
 
     CONTEXTE:
     {context}
-
+ 
     QUESTION:
     {q.question}
     """
