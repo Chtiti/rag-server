@@ -1,55 +1,86 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from qdrant_client import QdrantClient
+from qdrant_client.http.models import VectorParams, Distance
 from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
-import uuid, os, requests
+import uuid
+import os
+import requests
 
-app = FastAPI()
+# ------------------ APP ------------------
+app = FastAPI(title="RAG Server")
 
+# ------------------ ENV ------------------
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-client = QdrantClient(
-    url=QDRANT_URL,
-    api_key=QDRANT_API_KEY
-)
+if not all([QDRANT_URL, QDRANT_API_KEY, GROQ_API_KEY]):
+    raise RuntimeError("❌ Missing environment variables")
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
+# ------------------ QDRANT ------------------
 COLLECTION = "rag_docs"
 
-client.recreate_collection(
-    collection_name=COLLECTION,
-    vectors_config={"size": 384, "distance": "Cosine"}
+client = QdrantClient(
+    url=QDRANT_URL,
+    api_key=QDRANT_API_KEY,
+    timeout=30
 )
 
+# Create collection ONLY if not exists
+if not client.collection_exists(COLLECTION):
+    client.create_collection(
+        collection_name=COLLECTION,
+        vectors_config=VectorParams(
+            size=384,
+            distance=Distance.COSINE
+        )
+    )
+
+# ------------------ MODEL (LAZY LOAD) ------------------
+_model = None
+
+def get_model():
+    global _model
+    if _model is None:
+        _model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _model
+
+# ------------------ SCHEMAS ------------------
 class Question(BaseModel):
     question: str
 
-
+# ------------------ ROUTES ------------------
 @app.get("/")
-def root():
+def health():
     return {"status": "RAG server running"}
 
-
+# ------------------ INGEST PDF ------------------
 @app.post("/ingest/pdf")
 async def ingest_pdf(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files allowed")
+
     reader = PdfReader(file.file)
-    text = ""
+    full_text = ""
 
     for page in reader.pages:
-        if page.extract_text():
-            text += page.extract_text()
+        text = page.extract_text()
+        if text:
+            full_text += text
+
+    if not full_text.strip():
+        raise HTTPException(status_code=400, detail="Empty PDF")
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=700,
         chunk_overlap=100
     )
 
-    chunks = splitter.split_text(text)
+    chunks = splitter.split_text(full_text)
+    model = get_model()
 
     points = []
     for chunk in chunks:
@@ -68,36 +99,40 @@ async def ingest_pdf(file: UploadFile = File(...)):
         points=points
     )
 
-    return {"status": "PDF ingested", "chunks": len(points)}
+    return {
+        "status": "PDF ingested successfully",
+        "chunks": len(points)
+    }
 
-
+# ------------------ QUERY ------------------
 @app.post("/query")
 def query_rag(q: Question):
+    model = get_model()
     query_vector = model.encode(q.question).tolist()
 
-    search = client.search(
+    results = client.search(
         collection_name=COLLECTION,
         query_vector=query_vector,
         limit=5
     )
 
-    if not search:
+    if not results:
         return {
-            "answer": "Aucun document trouvé. Merci d’uploader un PDF.",
+            "answer": "Aucun document trouvé. Veuillez uploader un PDF.",
             "sources": []
         }
 
-    context = "\n".join([hit.payload["text"] for hit in search])
+    context = "\n".join(hit.payload["text"] for hit in results)
 
     prompt = f"""
-    Réponds à la question uniquement avec le contexte.
+Réponds uniquement avec le contexte suivant.
 
-    CONTEXTE:
-    {context}
- 
-    QUESTION:
-    {q.question}
-    """
+CONTEXTE:
+{context}
+
+QUESTION:
+{q.question}
+"""
 
     response = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
@@ -107,13 +142,18 @@ def query_rag(q: Question):
         },
         json={
             "model": "llama3-8b-8192",
-            "messages": [{"role": "user", "content": prompt}]
-        }
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2
+        },
+        timeout=30
     )
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="LLM error")
 
     answer = response.json()["choices"][0]["message"]["content"]
 
     return {
         "answer": answer,
-        "sources": list(set([hit.payload["source"] for hit in search]))
+        "sources": list({hit.payload["source"] for hit in results})
     }
