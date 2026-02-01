@@ -1,240 +1,213 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from pypdf import PdfReader
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import VectorParams, Distance
 import requests
 import uuid
 import os
 import time
-from typing import List
 
-# ================== CONFIG LÉGÈRE ==================
+# ================== CONFIG HUGGING FACE ==================
 
-# Environnement Render - variables minimales
+# Récupérer depuis les Environment Variables de Render
 HF_TOKEN = os.environ.get("HF_TOKEN")
 if not HF_TOKEN:
-    print("⚠️  HF_TOKEN non configuré dans Render Environment Variables")
+    print("⚠️ HF_TOKEN non configuré dans Render Environment Variables")
 
-# Modèle plus petit pour économiser la mémoire
-MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-VECTOR_SIZE = 384  # Taille fixe pour ce modèle
+# Configuration Hugging Face (comme dans votre ancien code)
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+VECTOR_SIZE = 1536  # Taille pour all-MiniLM-L6-v2
 HF_API_URL = f"https://api-inference.huggingface.co/models/{MODEL_NAME}"
 
-# ===================================================
+COLLECTION_NAME = "rag_docs"
+
+# =========================================================
 
 app = FastAPI()
 
-# Stockage SIMPLE en mémoire (léger)
-documents = []  # Liste de tuples (id, vector, text, source)
+# Qdrant en mémoire (comme avant)
+qdrant = QdrantClient(":memory:")
 
-# ================== FONCTIONS OPTIMISÉES ==================
+# créer collection (comme avant)
+qdrant.recreate_collection(
+    collection_name=COLLECTION_NAME,
+    vectors_config=VectorParams(
+        size=VECTOR_SIZE,
+        distance=Distance.COSINE
+    )
+)
 
-def split_text_fast(text: str, chunk_size=300) -> List[str]:
-    """Découpe simple sans chevauchement pour économiser la RAM"""
-    return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size) if text[i:i+chunk_size].strip()]
+# ================== FONCTION EMBEDDING HUGGING FACE ==================
 
-def get_embedding(text: str, max_retries=2) -> List[float]:
-    """Embedding avec timeout court et peu de retry"""
+def embed_text(text: str):
+    """Fonction embedding avec Hugging Face API (remplace Groq)"""
+    
     if not HF_TOKEN:
-        raise HTTPException(status_code=500, detail="HF_TOKEN non configuré sur Render")
+        raise HTTPException(
+            status_code=500, 
+            detail="HF_TOKEN non configuré. Ajoutez-le dans Render Environment Variables"
+        )
     
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    payload = {"inputs": text, "parameters": {"truncation": True}}
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json"
+    }
     
+    payload = {
+        "inputs": text,
+        "parameters": {
+            "truncation": True,
+            "max_length": 512
+        }
+    }
+    
+    # Essayer plusieurs fois (Hugging Face peut être lent)
+    max_retries = 3
     for attempt in range(max_retries):
         try:
-            resp = requests.post(HF_API_URL, headers=headers, json=payload, timeout=45)
+            response = requests.post(
+                HF_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=60  # Hugging Face peut être lent
+            )
             
-            if resp.status_code == 200:
-                data = resp.json()
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Hugging Face retourne différents formats
                 if isinstance(data, list):
-                    return data[0] if isinstance(data[0], list) else data
-                return data
-            elif resp.status_code == 503 and attempt < max_retries - 1:
-                time.sleep(10)
+                    if isinstance(data[0], list):
+                        return data[0]  # Format [[...]]
+                    return data  # Format [...]
+                else:
+                    return data
+                    
+            elif response.status_code == 503:
+                # Modèle en cours de chargement
+                wait_time = 10 * (attempt + 1)
+                print(f"⏳ Modèle en chargement... attente {wait_time}s")
+                time.sleep(wait_time)
                 continue
+                
+            elif response.status_code == 401:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Token Hugging Face invalide"
+                )
+                
             else:
-                raise Exception(f"API error: {resp.status_code}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Erreur Hugging Face: {response.status_code} - {response.text}"
+                )
                 
         except requests.exceptions.Timeout:
             if attempt < max_retries - 1:
-                time.sleep(5)
+                print(f"⏱️ Timeout, nouvelle tentative {attempt + 2}/{max_retries}")
                 continue
-            raise Exception("Timeout")
+            raise HTTPException(
+                status_code=504,
+                detail="Timeout Hugging Face API"
+            )
     
-    raise Exception("Failed after retries")
+    raise HTTPException(
+        status_code=500,
+        detail=f"Échec après {max_retries} tentatives"
+    )
 
-def cosine_similarity(a: List[float], b: List[float]) -> float:
-    """Calcul de similarité cosine simple"""
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = sum(x * x for x in a) ** 0.5
-    norm_b = sum(y * y for y in b) ** 0.5
-    return dot / (norm_a * norm_b) if norm_a and norm_b else 0
+# ================== AUTRES FONCTIONS (IDENTIQUES À AVANT) ==================
 
-def search_similar(query_vector: List[float], limit=3):
-    """Recherche linéaire simple (assez rapide pour 500MB)"""
-    results = []
-    for doc_id, vector, text, source in documents:
-        score = cosine_similarity(query_vector, vector)
-        if score > 0.3:  # Seuil minimum
-            results.append((score, text, source))
-    
-    # Trier par score
-    results.sort(key=lambda x: x[0], reverse=True)
-    return results[:limit]
+def split_text(text, size=200):
+    """Découpe le texte en chunks (identique à avant)"""
+    for i in range(0, len(text), size):
+        yield text[i:i + size]
 
-# ================== MODÈLES ==================
+# ================== MODELS (IDENTIQUES À AVANT) ==================
 
 class Question(BaseModel):
     question: str
 
-# ================== ENDPOINTS ==================
+# ================== ENDPOINTS (IDENTIQUES À AVANT) ==================
+
+@app.post("/upload")
+async def upload_pdf(file: UploadFile = File(...)):
+    """Identique à votre ancien code, juste l'embedding change"""
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="PDF requis")
+
+    reader = PdfReader(file.file)
+    total_chunks = 0
+
+    for page in reader.pages:
+        text = page.extract_text()
+        if not text:
+            continue
+
+        for chunk in split_text(text):
+            vector = embed_text(chunk)  # Utilise Hugging Face maintenant
+
+            qdrant.upsert(
+                collection_name=COLLECTION_NAME,
+                points=[{
+                    "id": str(uuid.uuid4()),
+                    "vector": vector,
+                    "payload": {
+                        "text": chunk,
+                        "source": file.filename
+                    }
+                }]
+            )
+
+            total_chunks += 1
+
+    return {
+        "status": "success",
+        "file": file.filename,
+        "chunks_stored": total_chunks
+    }
+
+@app.post("/ask")
+async def ask_question(data: Question):
+    """Identique à votre ancien code, juste l'embedding change"""
+    question_vector = embed_text(data.question)  # Utilise Hugging Face maintenant
+
+    results = qdrant.search(
+        collection_name=COLLECTION_NAME,
+        query_vector=question_vector,
+        limit=3
+    )
+
+    if not results:
+        return {
+            "answer": "Aucune information trouvée dans le document."
+        }
+
+    contexts = [r.payload["text"] for r in results]
+
+    return {
+        "question": data.question,
+        "contexts": contexts
+    }
 
 @app.get("/")
 def root():
     return {
-        "status": "ok",
-        "memory": "optimized_500mb",
+        "service": "RAG API",
+        "embedding": "Hugging Face",
         "model": MODEL_NAME,
-        "documents_count": len(documents)
+        "vector_size": VECTOR_SIZE,
+        "collection": COLLECTION_NAME
     }
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "hf_token_configured": bool(HF_TOKEN),
-        "documents": len(documents)
+        "qdrant": "active",
+        "embedding": "Hugging Face"
     }
-
-@app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
-    """Upload simple avec traitement page par page"""
-    
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(400, "PDF only")
-    
-    try:
-        # Lire PDF avec buffer limité
-        reader = PdfReader(file.file)
-        chunks_added = 0
-        
-        # Limiter à 20 pages max pour éviter OOM
-        max_pages = min(20, len(reader.pages))
-        
-        for page_num, page in enumerate(reader.pages[:max_pages], 1):
-            text = page.extract_text()
-            if not text or len(text) < 50:
-                continue
-                
-            # Découpage et traitement
-            for chunk in split_text_fast(text):
-                if len(chunk) < 30:
-                    continue
-                    
-                try:
-                    vector = get_embedding(chunk)
-                    
-                    # Vérifier taille du vecteur
-                    if len(vector) != VECTOR_SIZE:
-                        # Ajuster si nécessaire
-                        if len(vector) > VECTOR_SIZE:
-                            vector = vector[:VECTOR_SIZE]
-                        else:
-                            vector = vector + [0.0] * (VECTOR_SIZE - len(vector))
-                    
-                    # Stocker en mémoire
-                    documents.append((
-                        str(uuid.uuid4()),
-                        vector,
-                        chunk,
-                        f"{file.filename}_p{page_num}"
-                    ))
-                    
-                    chunks_added += 1
-                    
-                    # Limiter le nombre total de documents
-                    if len(documents) > 1000:  # Hard limit pour 500MB
-                        documents.pop(0)
-                    
-                    # Pause pour éviter de surcharger l'API Hugging Face
-                    if chunks_added % 5 == 0:
-                        time.sleep(0.5)
-                        
-                except Exception as e:
-                    print(f"Chunk error: {e}")
-                    continue
-        
-        return {
-            "status": "success",
-            "file": file.filename,
-            "chunks": chunks_added,
-            "total_documents": len(documents),
-            "warning": "Limited to 20 pages for memory safety" if len(reader.pages) > 20 else None
-        }
-        
-    except Exception as e:
-        raise HTTPException(500, f"Upload error: {str(e)}")
-
-@app.post("/ask")
-async def ask_question(data: Question):
-    """Question simple avec recherche"""
-    
-    if not data.question.strip():
-        raise HTTPException(400, "Question required")
-    
-    if not documents:
-        return {
-            "question": data.question,
-            "answer": "No documents uploaded yet",
-            "contexts": []
-        }
-    
-    try:
-        # Embedding de la question
-        question_vector = get_embedding(data.question)
-        
-        # Recherche
-        results = search_similar(question_vector, limit=3)
-        
-        if not results:
-            return {
-                "question": data.question,
-                "answer": "No relevant information found",
-                "contexts": []
-            }
-        
-        # Extraire les contextes
-        contexts = [text for _, text, _ in results]
-        scores = [round(score, 3) for score, _, _ in results]
-        
-        return {
-            "question": data.question,
-            "contexts": contexts,
-            "scores": scores,
-            "top_score": scores[0] if scores else 0
-        }
-        
-    except Exception as e:
-        raise HTTPException(500, f"Ask error: {str(e)}")
-
-@app.get("/stats")
-def stats():
-    """Statistiques minimales"""
-    memory_usage = len(documents) * VECTOR_SIZE * 4 / 1024 / 1024  # Estimation MB
-    return {
-        "documents_count": len(documents),
-        "estimated_memory_mb": round(memory_usage, 2),
-        "vector_size": VECTOR_SIZE,
-        "max_documents": 1000
-    }
-
-@app.delete("/clear")
-def clear():
-    """Vider la mémoire"""
-    global documents
-    count = len(documents)
-    documents = []
-    return {"status": "cleared", "documents_removed": count}
 
 # ================== MIDDLEWARE CORS ==================
 
@@ -253,9 +226,9 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     
-    print(f"🚀 Server starting on port {port}")
-    print(f"📦 Model: {MODEL_NAME}")
-    print(f"💾 Memory limit: 500MB")
-    print(f"🔢 Vector size: {VECTOR_SIZE}")
+    print(f"🚀 Serveur démarré sur le port {port}")
+    print(f"📦 Modèle Hugging Face: {MODEL_NAME}")
+    print(f"🔢 Taille vecteurs: {VECTOR_SIZE}")
+    print(f"🗄️ Collection Qdrant: {COLLECTION_NAME}")
     
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+    uvicorn.run(app, host="0.0.0.0", port=port)
