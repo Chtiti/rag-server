@@ -1,6 +1,7 @@
 fastapi
 uvicorn
-requests
-pypdf
-langchain-text-splitters
 qdrant-client
+pypdf
+requests
+langchain-text-splitters
+python-multipart
