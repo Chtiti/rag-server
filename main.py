@@ -52,36 +52,49 @@ def health():
     return {"status": "RAG server running"}
 
 # ========= INGEST PDF =========
+import io
+
 @app.post("/ingest/pdf")
 async def ingest_pdf(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "Only PDF allowed")
+    content = await file.read()
+    print("PDF:", file.filename, "SIZE:", len(content))
 
-    from pypdf import PdfReader
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-    reader = PdfReader(file.file)
-
+    reader = PdfReader(io.BytesIO(content))
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=600,
-        chunk_overlap=100
+        chunk_size=500,
+        chunk_overlap=50
     )
 
-    client = get_qdrant()
-    count = 0
+    total_chunks = 0
 
     for page in reader.pages:
-        text = page.extract_text()
-        if not text:
+        page_text = page.extract_text()
+        print("PAGE TEXT:", page_text[:200] if page_text else "EMPTY")
+
+        if not page_text:
             continue
 
-        chunks = splitter.split_text(text)
+        chunks = splitter.split_text(page_text)
 
-        for chunk in chunks:
-            if len(chunk) < 50:
-                continue
+        for chunk in chunks[:3]:
+            response = requests.post(
+                "https://api.groq.com/openai/v1/embeddings",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "text-embedding-3-small",
+                    "input": chunk
+                },
+                timeout=30
+            )
 
-            vector = embed_text(chunk)
+            if response.status_code != 200:
+                print("EMBED ERROR:", response.text)
+                raise HTTPException(500, "Embedding failed")
+
+            vector = response.json()["data"][0]["embedding"]
 
             client.upsert(
                 collection_name=COLLECTION,
@@ -95,16 +108,13 @@ async def ingest_pdf(file: UploadFile = File(...)):
                 }]
             )
 
-            count += 1
+            total_chunks += 1
 
-    if count == 0:
-        raise HTTPException(400, "No text extracted from PDF")
+    if total_chunks == 0:
+        raise HTTPException(400, "No text extracted")
 
-    return {
-        "status": "PDF ingested",
-        "chunks": count
-    }
-
+    return {"status": "ok", "chunks": total_chunks}
+    
 # ========= QUERY =========
 @app.post("/query")
 def query_rag(q: Question):
