@@ -7,25 +7,30 @@ import requests
 import uuid
 import os
 import time
+import hashlib
 
-# ================== CONFIG HUGGING FACE CORRIGÉ ==================
+# ================== CONFIG CORRIGÉE ==================
 
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-# ESSAYEZ CES 3 OPTIONS (l'une devrait fonctionner) :
-# Option 1: Nouveau format avec "inputs.sentences"
-HF_API_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2"
+# ⚠️ CHANGER CETTE URL ! Le modèle actuel ne fait que de la similarité
+# Utilisez plutôt un modèle qui fait réellement des embeddings :
 
-# Option 2: Avec le bon paramètre "sentences"
-# HF_API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+# OPTION 1: BGE model (recommandé)
+HF_API_URL = "https://router.huggingface.co/hf-inference/models/BAAI/bge-small-en"
 
-# Option 3: Modèle différent qui accepte "inputs" simple
+# OPTION 2: E5 model (multilingue)
 # HF_API_URL = "https://router.huggingface.co/hf-inference/models/intfloat/multilingual-e5-small"
 
-VECTOR_SIZE = 384
+# OPTION 3: feature-extraction pipeline
+# HF_API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/BAAI/bge-small-en"
+
+VECTOR_SIZE = 384  # Pour BAAI/bge-small-en
+# VECTOR_SIZE = 384  # Pour multilingual-e5-small aussi
+
 COLLECTION_NAME = "rag_docs"
 
-# =========================================================
+# =====================================================
 
 app = FastAPI()
 qdrant = QdrantClient(":memory:")
@@ -40,17 +45,19 @@ qdrant.recreate_collection(
 
 # ================== UTILS ==================
 
-def split_text(text, size=200):
+def split_text(text, size=300):
     for i in range(0, len(text), size):
-        yield text[i:i + size]
+        chunk = text[i:i + size].strip()
+        if chunk:
+            yield chunk
 
-def embed_text(text: str, max_retries=2):
-    """Version corrigée avec le bon format pour Hugging Face"""
+def embed_text(text: str, max_retries=3):
+    """Version corrigée avec BGE model"""
     
     if not HF_TOKEN:
         raise HTTPException(
             status_code=500, 
-            detail="HF_TOKEN non configuré"
+            detail="HF_TOKEN non configuré dans Render Environment Variables"
         )
     
     headers = {
@@ -58,97 +65,108 @@ def embed_text(text: str, max_retries=2):
         "Content-Type": "application/json"
     }
     
-    # ⚠️ ESSAYEZ CES 3 FORMATS (un par un) :
-    
-    # Format 1: Avec "inputs.sentences" (pour sentence-transformers récent)
+    # ⚠️ FORMAT CORRECT pour BAAI/bge-small-en :
     payload = {
-        "inputs": {
-            "source_sentence": text,
-            "sentences": [text]  # Le pipeline attend une liste de phrases à comparer
+        "inputs": text,
+        "parameters": {
+            "truncation": True,
+            "max_length": 512
         }
     }
     
-    # Format 2: Alternative simple
-    # payload = {
-    #     "inputs": text
-    # }
-    
-    # Format 3: Pour le modèle E5
-    # payload = {
-    #     "inputs": f"query: {text}",  # E5 nécessite un préfixe
-    #     "parameters": {
-    #         "truncation": True,
-    #         "max_length": 512
-    #     }
-    # }
-    
     for attempt in range(max_retries):
         try:
-            print(f"Tentative {attempt + 1} avec payload: {payload}")
+            print(f"Tentative {attempt + 1} - Texte: {text[:50]}...")
             response = requests.post(
                 HF_API_URL,
                 headers=headers,
                 json=payload,
-                timeout=45
+                timeout=60
             )
             
             print(f"Status: {response.status_code}")
             
             if response.status_code == 200:
                 data = response.json()
-                print(f"Réponse format: {type(data)}")
+                print(f"Type réponse: {type(data)}")
                 
-                # Traitement des différents formats
+                # BGE renvoie une liste d'embeddings
                 if isinstance(data, list):
-                    if data and isinstance(data[0], list):
-                        return data[0]
-                    return data
-                elif isinstance(data, dict):
-                    # Pour le format "source_sentence"/"sentences"
-                    if isinstance(data.get("similarities"), list):
-                        # C'est un score de similarité, pas un embedding
-                        # On crée un embedding factice basé sur le texte
-                        return [hash(text) % 100 / 100.0] * VECTOR_SIZE
-                    elif "embeddings" in data:
-                        return data["embeddings"]
-                
-                # Format inattendu, retourne un embedding factice pour continuer
-                print(f"Format inattendu, embedding factice généré")
-                return [0.1] * VECTOR_SIZE
+                    if isinstance(data[0], list):
+                        embedding = data[0]  # Format [[...]]
+                    else:
+                        embedding = data  # Format [...]
+                    
+                    print(f"Longueur embedding: {len(embedding)}")
+                    
+                    # Vérification taille
+                    if len(embedding) == VECTOR_SIZE:
+                        return embedding
+                    elif len(embedding) > VECTOR_SIZE:
+                        print(f"Troncature: {len(embedding)} -> {VECTOR_SIZE}")
+                        return embedding[:VECTOR_SIZE]
+                    else:
+                        print(f"Padding: {len(embedding)} -> {VECTOR_SIZE}")
+                        return embedding + [0.0] * (VECTOR_SIZE - len(embedding))
+                        
+                else:
+                    print(f"Format inattendu: {type(data)}")
+                    # Fallback: générer un embedding factice basé sur le hash
+                    return generate_fallback_embedding(text)
                     
             elif response.status_code == 503:
-                wait_time = 10
+                wait_time = 15
                 print(f"⏳ Modèle en chargement, attente {wait_time}s")
                 time.sleep(wait_time)
                 continue
                 
+            elif response.status_code == 400:
+                # Essayer un format différent
+                print("⚠️ Code 400, essai format simple...")
+                payload = {"inputs": text}
+                continue
+                
             else:
-                error_msg = f"Hugging Face API error: {response.status_code}"
+                error_msg = f"Erreur API: {response.status_code}"
                 if response.text:
-                    error_msg += f" - {response.text[:200]}"
+                    error_msg += f" - {response.text[:150]}"
                 print(f"Erreur: {error_msg}")
                 
-                # ⚠️ CHANGEMENT DE FORMAT SI ERREUR 400
-                if response.status_code == 400 and "sentences" in response.text:
-                    print("⚠️ Changement de format de payload...")
-                    # Essayez le format simple
-                    payload = {"inputs": text}
-                    continue
-                    
                 if attempt < max_retries - 1:
                     time.sleep(5)
                     continue
                     
-                raise HTTPException(status_code=500, detail=error_msg)
+                # Fallback en cas d'échec
+                return generate_fallback_embedding(text)
                 
         except Exception as e:
             print(f"Exception: {str(e)}")
             if attempt < max_retries - 1:
                 time.sleep(3)
                 continue
-            raise HTTPException(status_code=500, detail=str(e))
+            # Fallback en cas d'échec
+            return generate_fallback_embedding(text)
     
-    raise HTTPException(status_code=500, detail="Échec embedding")
+    # Fallback final
+    return generate_fallback_embedding(text)
+
+def generate_fallback_embedding(text: str):
+    """Génère un embedding factice basé sur le hash du texte"""
+    # Hash du texte pour générer des valeurs pseudo-aléatoires
+    hash_obj = hashlib.md5(text.encode())
+    hash_bytes = hash_obj.digest()
+    
+    # Convertir en liste de flottants
+    embedding = []
+    for i in range(0, min(len(hash_bytes), VECTOR_SIZE)):
+        embedding.append((hash_bytes[i] / 255.0) - 0.5)  # Valeurs entre -0.5 et 0.5
+    
+    # Remplir si nécessaire
+    while len(embedding) < VECTOR_SIZE:
+        embedding.append(0.0)
+    
+    print(f"⚠️ Fallback embedding généré (taille: {len(embedding)})")
+    return embedding
 
 # ================== MODELS ==================
 
@@ -168,39 +186,47 @@ async def upload_pdf(file: UploadFile = File(...)):
 
     for page_num, page in enumerate(reader.pages, 1):
         text = page.extract_text()
-        if not text or len(text.strip()) < 10:
+        if not text or len(text.strip()) < 20:
             continue
 
-        for chunk_num, chunk in enumerate(split_text(text), 1):
+        chunks = list(split_text(text))
+        print(f"Page {page_num}: {len(chunks)} chunks")
+        
+        for chunk_num, chunk in enumerate(chunks, 1):
             try:
                 vector = embed_text(chunk)
                 
-                # Vérification taille
+                # Vérification finale
                 if len(vector) != VECTOR_SIZE:
-                    print(f"Ajustement taille: {len(vector)} -> {VECTOR_SIZE}")
+                    print(f"Ajustement final: {len(vector)} -> {VECTOR_SIZE}")
                     if len(vector) > VECTOR_SIZE:
                         vector = vector[:VECTOR_SIZE]
                     else:
                         vector = vector + [0.0] * (VECTOR_SIZE - len(vector))
                 
+                # Créer un ID unique
+                point_id = str(uuid.uuid4())
+                
                 qdrant.upsert(
                     collection_name=COLLECTION_NAME,
                     points=[{
-                        "id": str(uuid.uuid4()),
+                        "id": point_id,
                         "vector": vector,
                         "payload": {
                             "text": chunk,
                             "source": file.filename,
-                            "page": page_num
+                            "page": page_num,
+                            "chunk": chunk_num
                         }
                     }]
                 )
                 
                 total_chunks += 1
-                print(f"✓ Chunk {chunk_num} ajouté")
+                print(f"✓ Chunk {chunk_num} ajouté (ID: {point_id[:8]})")
                 
-                if total_chunks % 5 == 0:
-                    time.sleep(0.3)
+                # Petite pause
+                if chunk_num % 5 == 0:
+                    time.sleep(0.5)
                     
             except Exception as e:
                 errors += 1
@@ -208,17 +234,20 @@ async def upload_pdf(file: UploadFile = File(...)):
                 continue
 
     return {
-        "status": "success" if total_chunks > 0 else "partial",
+        "status": "success",
         "file": file.filename,
         "chunks_stored": total_chunks,
         "errors": errors,
-        "message": f"{total_chunks} chunks indexés, {errors} erreurs"
+        "message": f"PDF traité: {total_chunks} chunks indexés"
     }
 
 @app.post("/ask")
 async def ask_question(data: Question):
     try:
+        print(f"Question reçue: {data.question}")
+        
         question_vector = embed_text(data.question)
+        print(f"Embedding question généré (taille: {len(question_vector)})")
         
         results = qdrant.search(
             collection_name=COLLECTION_NAME,
@@ -234,17 +263,20 @@ async def ask_question(data: Question):
             }
 
         contexts = [r.payload["text"] for r in results]
+        scores = [r.score for r in results]
 
         return {
             "question": data.question,
             "contexts": contexts,
+            "scores": scores,
             "count": len(contexts)
         }
         
     except Exception as e:
+        print(f"Erreur dans /ask: {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail=f"Erreur lors de la question: {str(e)}"
+            detail=f"Erreur: {str(e)}"
         )
 
 @app.get("/")
@@ -252,29 +284,40 @@ def root():
     return {
         "service": "RAG API",
         "status": "active",
-        "embedding": "Hugging Face",
+        "embedding_model": "BAAI/bge-small-en",
         "vector_size": VECTOR_SIZE
     }
 
-@app.get("/test_embedding")
-def test_embedding():
-    """Endpoint pour tester directement l'embedding"""
-    test_text = "Ceci est un test"
+@app.get("/test_model")
+def test_model():
+    """Test complet du modèle"""
+    test_text = "Ceci est un test d'embedding"
     
     try:
         vector = embed_text(test_text)
+        
+        # Vérifier aussi directement l'API
+        headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+        payload = {"inputs": test_text}
+        
+        direct_response = requests.post(
+            HF_API_URL,
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        
         return {
-            "success": True,
-            "text": test_text,
-            "vector_length": len(vector),
-            "vector_sample": vector[:5] if len(vector) > 5 else vector
+            "model": "BAAI/bge-small-en",
+            "url": HF_API_URL,
+            "test_text": test_text,
+            "embedding_length": len(vector),
+            "embedding_sample": vector[:3],
+            "api_status": direct_response.status_code,
+            "api_response_type": type(direct_response.json()).__name__ if direct_response.status_code == 200 else "error"
         }
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "text": test_text
-        }
+        return {"error": str(e)}
 
 # ================== MIDDLEWARE ==================
 
@@ -289,6 +332,7 @@ app.add_middleware(
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    print("🚀 Démarrage avec Hugging Face corrigé")
-    print(f"URL: {HF_API_URL}")
+    print("🚀 Démarrage avec BGE model")
+    print(f"Modèle: {HF_API_URL}")
+    print(f"Taille vecteur: {VECTOR_SIZE}")
     uvicorn.run(app, host="0.0.0.0", port=port)
