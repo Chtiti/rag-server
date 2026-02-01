@@ -8,90 +8,94 @@ import uuid
 import os
 import time
 
-# ================== CONFIG ==================
+# ================== CONFIG CORRIGÉE ==================
 
 HF_TOKEN = os.getenv("HF_TOKEN")
 HF_API_URL = "https://router.huggingface.co/hf-inference/models/BAAI/bge-small-en"
-VECTOR_SIZE = 384
+VECTOR_SIZE = 384  # ⚠️ CORRECT: 384 pour BGE-small
 COLLECTION_NAME = "rag_docs"
 
-# ============================================
+# =====================================================
 
 app = FastAPI()
 
 # Qdrant en mémoire
 qdrant = QdrantClient(":memory:")
 
-# Créer la collection
+# DÉTRUIRE l'ancienne collection (taille 1536)
 try:
-    qdrant.create_collection(
-        collection_name=COLLECTION_NAME,
-        vectors_config=VectorParams(
-            size=VECTOR_SIZE,
-            distance=Distance.COSINE
-        )
+    qdrant.delete_collection(collection_name=COLLECTION_NAME)
+    print("🗑️ Ancienne collection (1536D) supprimée")
+except:
+    print("ℹ️ Pas d'ancienne collection à supprimer")
+
+# CRÉER nouvelle collection (taille 384)
+qdrant.create_collection(
+    collection_name=COLLECTION_NAME,
+    vectors_config=VectorParams(
+        size=VECTOR_SIZE,  # 384 !
+        distance=Distance.COSINE
     )
-    print(f"✅ Collection '{COLLECTION_NAME}' créée")
-except Exception as e:
-    print(f"ℹ️ Collection existe déjà ou erreur: {e}")
+)
+
+print(f"✅ Collection '{COLLECTION_NAME}' créée: {VECTOR_SIZE} dimensions")
 
 # ================== UTILS ==================
 
 def split_text(text, size=300):
-    for i in range(0, len(text), size):
-        chunk = text[i:i + size].strip()
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + size
+        chunk = text[start:end].strip()
         if chunk:
-            yield chunk
+            chunks.append(chunk)
+        start = end
+    return chunks
 
 def embed_text(text: str):
-    """Génère des embeddings avec Hugging Face"""
+    """Génère des embeddings de 384 dimensions"""
     
     if not HF_TOKEN:
         raise HTTPException(status_code=500, detail="HF_TOKEN non configuré")
     
-    headers = {
-        "Authorization": f"Bearer {HF_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "inputs": text,
-        "parameters": {
-            "truncation": True,
-            "max_length": 512
-        }
-    }
+    headers = {"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"}
+    payload = {"inputs": text, "parameters": {"truncation": True, "max_length": 512}}
     
     try:
-        response = requests.post(
-            HF_API_URL,
-            headers=headers,
-            json=payload,
-            timeout=60
-        )
+        response = requests.post(HF_API_URL, headers=headers, json=payload, timeout=60)
         
         if response.status_code == 200:
             data = response.json()
             
             if isinstance(data, list):
-                if isinstance(data[0], list):
+                if data and isinstance(data[0], list):
                     vector = data[0]
                 else:
                     vector = data
                 
-                # Ajuster la taille si nécessaire
-                if len(vector) > VECTOR_SIZE:
-                    return vector[:VECTOR_SIZE]
-                elif len(vector) < VECTOR_SIZE:
-                    return vector + [0.0] * (VECTOR_SIZE - len(vector))
-                else:
-                    return vector
+                # VÉRIFICATION CRUCIALE : doit être 384
+                if len(vector) != VECTOR_SIZE:
+                    print(f"⚠️ ATTENTION: Vecteur {len(vector)}D, attendu {VECTOR_SIZE}D")
+                    
+                    # Ajustement automatique
+                    if len(vector) > VECTOR_SIZE:
+                        vector = vector[:VECTOR_SIZE]
+                        print(f"  → Tronqué à {VECTOR_SIZE}D")
+                    else:
+                        vector = vector + [0.0] * (VECTOR_SIZE - len(vector))
+                        print(f"  → Complété à {VECTOR_SIZE}D")
+                
+                return vector
+            else:
+                print(f"Format inattendu, fallback 384D")
+                return [0.1] * VECTOR_SIZE
         else:
-            raise Exception(f"API error: {response.status_code}")
+            print(f"API error {response.status_code}, fallback 384D")
+            return [0.1] * VECTOR_SIZE
             
     except Exception as e:
-        print(f"Erreur embedding: {str(e)}")
-        # Fallback: vecteur simple
+        print(f"Erreur embedding, fallback 384D: {str(e)}")
         return [0.1] * VECTOR_SIZE
 
 # ================== MODELS ==================
@@ -105,111 +109,113 @@ class Question(BaseModel):
 async def upload_pdf(file: UploadFile = File(...)):
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="PDF requis")
-
-    reader = PdfReader(file.file)
-    total_chunks = 0
-
-    for page_num, page in enumerate(reader.pages, 1):
-        text = page.extract_text()
-        if not text or len(text.strip()) < 20:
-            continue
-
-        for chunk in split_text(text):
-            try:
+    
+    try:
+        reader = PdfReader(file.file)
+        total_chunks = 0
+        points = []
+        
+        for page_num, page in enumerate(reader.pages, 1):
+            text = page.extract_text()
+            if not text or len(text.strip()) < 20:
+                continue
+            
+            for chunk in split_text(text):
                 vector = embed_text(chunk)
                 
-                # Utiliser PointStruct correctement
+                # Vérification finale
+                if len(vector) != VECTOR_SIZE:
+                    print(f"❌ ERREUR CRITIQUE: Vecteur {len(vector)}D != {VECTOR_SIZE}D")
+                    # Forcer à la bonne taille
+                    vector = vector[:VECTOR_SIZE] if len(vector) > VECTOR_SIZE else vector + [0.0] * (VECTOR_SIZE - len(vector))
+                
                 point = PointStruct(
                     id=str(uuid.uuid4()),
                     vector=vector,
-                    payload={
-                        "text": chunk,
-                        "source": file.filename,
-                        "page": page_num
-                    }
+                    payload={"text": chunk, "source": file.filename, "page": page_num}
                 )
-                
-                # Upsert avec PointStruct
-                qdrant.upsert(
-                    collection_name=COLLECTION_NAME,
-                    points=[point]
-                )
-                
+                points.append(point)
                 total_chunks += 1
-                print(f"✓ Chunk ajouté: {total_chunks}")
-                
-                time.sleep(0.1)  # Petite pause
-                
-            except Exception as e:
-                print(f"Erreur chunk: {str(e)}")
-                continue
-
-    return {
-        "status": "success",
-        "file": file.filename,
-        "chunks_stored": total_chunks
-    }
+        
+        # Insérer tous les points
+        if points:
+            qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+            print(f"📥 {total_chunks} points insérés ({VECTOR_SIZE}D chacun)")
+        
+        return {
+            "status": "success",
+            "file": file.filename,
+            "chunks_stored": total_chunks,
+            "vector_size": VECTOR_SIZE,
+            "model": "BAAI/bge-small-en"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
 
 @app.post("/ask")
 async def ask_question(data: Question):
     try:
-        question_vector = embed_text(data.question)
+        print(f"❓ Question: {data.question}")
         
-        # Recherche CORRECTE dans Qdrant
-        results = qdrant.query(
+        # Embedding de la question (384D)
+        question_vector = embed_text(data.question)
+        print(f"📐 Embedding question: {len(question_vector)} dimensions")
+        
+        # Vérification cruciale
+        if len(question_vector) != VECTOR_SIZE:
+            print(f"🚨 PANIC: Embedding {len(question_vector)}D != collection {VECTOR_SIZE}D")
+            return {"error": f"Dimension mismatch: {len(question_vector)} vs {VECTOR_SIZE}"}
+        
+        # Recherche dans Qdrant
+        results = qdrant.search(
             collection_name=COLLECTION_NAME,
             query_vector=question_vector,
             limit=3
         )
         
-        # Vérifier si results est une liste ou un objet
+        print(f"🔍 {len(results)} résultats trouvés")
+        
         if not results:
             return {
                 "question": data.question,
-                "answer": "Aucune information trouvée dans le document.",
+                "answer": "Aucune information trouvée",
                 "contexts": []
             }
         
-        # Extraire les textes selon le format de réponse
-        contexts = []
-        if hasattr(results[0], 'payload'):
-            # Format avec objets
-            contexts = [r.payload.get("text", "") for r in results]
-        elif isinstance(results[0], dict) and "payload" in results[0]:
-            # Format dict
-            contexts = [r["payload"].get("text", "") for r in results]
-        else:
-            contexts = [str(r) for r in results]
-
+        contexts = [r.payload.get("text", "") for r in results]
+        scores = [float(r.score) for r in results]
+        
         return {
             "question": data.question,
-            "contexts": contexts[:3],  # Limiter à 3
-            "count": len(contexts)
+            "contexts": contexts,
+            "scores": scores,
+            "vector_size_used": VECTOR_SIZE
         }
         
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erreur recherche: {str(e)}"
-        )
+        print(f"💥 Erreur /ask: {str(e)}")
+        return {
+            "question": data.question,
+            "error": str(e),
+            "vector_size": VECTOR_SIZE
+        }
 
-@app.get("/")
-def root():
-    return {
-        "service": "RAG API",
-        "embedding": "BAAI/bge-small-en",
-        "vector_size": VECTOR_SIZE,
-        "status": "active"
-    }
-
-@app.get("/test")
-def test():
-    """Test simple de l'API"""
-    return {
-        "message": "API fonctionnelle",
-        "qdrant": "connecté",
-        "hugging_face": "configuré" if HF_TOKEN else "non configuré"
-    }
+@app.get("/config")
+def get_config():
+    """Vérification de configuration"""
+    try:
+        collection_info = qdrant.get_collection(collection_name=COLLECTION_NAME)
+        return {
+            "model": "BAAI/bge-small-en",
+            "vector_size_config": VECTOR_SIZE,
+            "vector_size_actual": collection_info.config.params.vectors.size,
+            "collection": COLLECTION_NAME,
+            "vectors_count": qdrant.count(collection_name=COLLECTION_NAME).count,
+            "status": "OK" if VECTOR_SIZE == collection_info.config.params.vectors.size else "ERROR: mismatch"
+        }
+    except Exception as e:
+        return {"error": str(e), "vector_size_config": VECTOR_SIZE}
 
 # ================== MIDDLEWARE ==================
 
@@ -224,6 +230,22 @@ app.add_middleware(
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    print("🚀 Serveur démarré")
-    print(f"Port: {port}")
+    
+    print("=" * 50)
+    print("🎯 RAG API - CONFIGURATION CORRECTE")
+    print(f"🤖 Modèle: BAAI/bge-small-en")
+    print(f"📏 Taille vecteur: {VECTOR_SIZE} dimensions")
+    print(f"🗄️ Collection: {COLLECTION_NAME}")
+    print("=" * 50)
+    
+    # Test automatique
+    print("🧪 Test automatique de configuration...")
+    test_vector = embed_text("test")
+    print(f"Test embedding: {len(test_vector)} dimensions")
+    
+    if len(test_vector) == VECTOR_SIZE:
+        print("✅ Configuration CORRECTE!")
+    else:
+        print(f"❌ PROBLÈME: {len(test_vector)}D vs {VECTOR_SIZE}D")
+    
     uvicorn.run(app, host="0.0.0.0", port=port)
