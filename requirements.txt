@@ -3,5 +3,4 @@ uvicorn
 qdrant-client
 pypdf
 requests
-langchain-text-splitters
 python-multipart

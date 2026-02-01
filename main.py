@@ -1,103 +1,81 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from pydantic import BaseModel
-import os, uuid, requests
+from pypdf import PdfReader
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import VectorParams, Distance
+import requests
+import uuid
+import os
 
-app = FastAPI(title="RAG Server (Render Free Safe)")
+# ================= CONFIG =================
 
-# ========= ENV =========
-QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY")  # clé API embeddings
+EMBEDDING_URL = "https://api.groq.com/openai/v1/embeddings"
+EMBEDDING_MODEL = "text-embedding-3-small"
 
-if not QDRANT_URL or not QDRANT_API_KEY or not GROQ_API_KEY:
-    raise RuntimeError("Missing environment variables")
+COLLECTION_NAME = "rag_docs"
+VECTOR_SIZE = 1536  # taille embedding
 
-COLLECTION = "rag_docs"
+# ==========================================
 
-# ========= UTILS =========
-def get_qdrant():
-    from qdrant_client import QdrantClient
-    return QdrantClient(
-        url=QDRANT_URL,
-        api_key=QDRANT_API_KEY,
-        timeout=10
+app = FastAPI()
+
+qdrant = QdrantClient(":memory:")  # léger RAM (OK pour test)
+
+# créer collection si inexistante
+qdrant.recreate_collection(
+    collection_name=COLLECTION_NAME,
+    vectors_config=VectorParams(
+        size=VECTOR_SIZE,
+        distance=Distance.COSINE
     )
+)
 
-def embed_text(text: str) -> list:
-    r = requests.post(
-        "https://api.groq.com/openai/v1/embeddings",
+# -------- fonctions utilitaires --------
+
+def split_text(text, size=200):
+    for i in range(0, len(text), size):
+        yield text[i:i + size]
+
+def embed_text(text: str):
+    response = requests.post(
+        EMBEDDING_URL,
         headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Authorization": f"Bearer {EMBEDDING_API_KEY}",
             "Content-Type": "application/json"
         },
         json={
-            "model": "text-embedding-3-small",
+            "model": EMBEDDING_MODEL,
             "input": text
         },
-        timeout=15
+        timeout=30
     )
 
-    if r.status_code != 200:
-        raise HTTPException(500, "Embedding API error")
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Erreur embeddings API")
 
-    return r.json()["data"][0]["embedding"]
+    return response.json()["data"][0]["embedding"]
 
-# ========= SCHEMA =========
-class Question(BaseModel):
-    question: str
+# --------------- API --------------------
 
-# ========= ROUTES =========
-@app.get("/")
-def health():
-    return {"status": "RAG server running"}
+@app.post("/upload")
+async def upload_pdf(file: UploadFile = File(...)):
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Fichier PDF requis")
 
-# ========= INGEST PDF =========
-import io
-
-@app.post("/ingest/pdf")
-async def ingest_pdf(file: UploadFile = File(...)):
-    content = await file.read()
-    print("PDF:", file.filename, "SIZE:", len(content))
-
-    reader = PdfReader(io.BytesIO(content))
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50
-    )
+    reader = PdfReader(file.file)
 
     total_chunks = 0
 
     for page in reader.pages:
-        page_text = page.extract_text()
-        print("PAGE TEXT:", page_text[:200] if page_text else "EMPTY")
-
-        if not page_text:
+        text = page.extract_text()
+        if not text:
             continue
 
-        chunks = splitter.split_text(page_text)
+        for chunk in split_text(text):
+            vector = embed_text(chunk)
 
-        for chunk in chunks[:3]:
-            response = requests.post(
-                "https://api.groq.com/openai/v1/embeddings",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "text-embedding-3-small",
-                    "input": chunk
-                },
-                timeout=30
-            )
-
-            if response.status_code != 200:
-                print("EMBED ERROR:", response.text)
-                raise HTTPException(500, "Embedding failed")
-
-            vector = response.json()["data"][0]["embedding"]
-
-            client.upsert(
-                collection_name=COLLECTION,
+            qdrant.upsert(
+                collection_name=COLLECTION_NAME,
                 points=[{
                     "id": str(uuid.uuid4()),
                     "vector": vector,
@@ -110,61 +88,8 @@ async def ingest_pdf(file: UploadFile = File(...)):
 
             total_chunks += 1
 
-    if total_chunks == 0:
-        raise HTTPException(400, "No text extracted")
-
-    return {"status": "ok", "chunks": total_chunks}
-    
-# ========= QUERY =========
-@app.post("/query")
-def query_rag(q: Question):
-    client = get_qdrant()
-    query_vector = embed_text(q.question)
-
-    results = client.search(
-        collection_name=COLLECTION,
-        query_vector=query_vector,
-        limit=5
-    )
-
-    if not results:
-        return {
-            "answer": "Aucun document trouvé. Uploadez un PDF.",
-            "sources": []
-        }
-
-    context = "\n".join(hit.payload["text"] for hit in results)
-
-    prompt = f"""
-Réponds uniquement avec le contexte suivant.
-
-CONTEXTE:
-{context}
-
-QUESTION:
-{q.question}
-"""
-
-    r = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": "llama3-8b-8192",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2
-        },
-        timeout=20
-    )
-
-    if r.status_code != 200:
-        raise HTTPException(500, "LLM error")
-
-    answer = r.json()["choices"][0]["message"]["content"]
-
     return {
-        "answer": answer,
-        "sources": list({hit.payload["source"] for hit in results})
+        "status": "success",
+        "file": file.filename,
+        "chunks_stored": total_chunks
     }
