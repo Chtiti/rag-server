@@ -6,134 +6,90 @@ from qdrant_client.http.models import VectorParams, Distance
 import requests
 import uuid
 import os
-import time
 
 # ================== CONFIG HUGGING FACE ==================
 
-# Récupérer depuis les Environment Variables de Render
-HF_TOKEN = os.environ.get("HF_TOKEN")
-if not HF_TOKEN:
-    print("⚠️ HF_TOKEN non configuré dans Render Environment Variables")
+# Variable d'environnement Render (au lieu de EMBEDDING_API_KEY)
+HF_TOKEN = os.getenv("HF_TOKEN")  # ⚠️ À configurer dans Render
+HF_API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
 
-# Configuration Hugging Face (comme dans votre ancien code)
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-VECTOR_SIZE = 1536  # Taille pour all-MiniLM-L6-v2
-HF_API_URL = f"https://api-inference.huggingface.co/models/{MODEL_NAME}"
-
+VECTOR_SIZE = 384  # Taille fixe pour le modèle Hugging Face
 COLLECTION_NAME = "rag_docs"
 
 # =========================================================
 
 app = FastAPI()
 
-# Qdrant en mémoire (comme avant)
+# Qdrant en mémoire (inchangé)
 qdrant = QdrantClient(":memory:")
 
-# créer collection (comme avant)
+# créer collection (taille vecteur modifiée)
 qdrant.recreate_collection(
     collection_name=COLLECTION_NAME,
     vectors_config=VectorParams(
-        size=VECTOR_SIZE,
+        size=VECTOR_SIZE,  # Maintenant 384 au lieu de 1536
         distance=Distance.COSINE
     )
 )
 
-# ================== FONCTION EMBEDDING HUGGING FACE ==================
-
-def embed_text(text: str):
-    """Fonction embedding avec Hugging Face API (remplace Groq)"""
-    
-    if not HF_TOKEN:
-        raise HTTPException(
-            status_code=500, 
-            detail="HF_TOKEN non configuré. Ajoutez-le dans Render Environment Variables"
-        )
-    
-    headers = {
-        "Authorization": f"Bearer {HF_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "inputs": text,
-        "parameters": {
-            "truncation": True,
-            "max_length": 512
-        }
-    }
-    
-    # Essayer plusieurs fois (Hugging Face peut être lent)
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(
-                HF_API_URL,
-                headers=headers,
-                json=payload,
-                timeout=60  # Hugging Face peut être lent
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                # Hugging Face retourne différents formats
-                if isinstance(data, list):
-                    if isinstance(data[0], list):
-                        return data[0]  # Format [[...]]
-                    return data  # Format [...]
-                else:
-                    return data
-                    
-            elif response.status_code == 503:
-                # Modèle en cours de chargement
-                wait_time = 10 * (attempt + 1)
-                print(f"⏳ Modèle en chargement... attente {wait_time}s")
-                time.sleep(wait_time)
-                continue
-                
-            elif response.status_code == 401:
-                raise HTTPException(
-                    status_code=401,
-                    detail="Token Hugging Face invalide"
-                )
-                
-            else:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Erreur Hugging Face: {response.status_code} - {response.text}"
-                )
-                
-        except requests.exceptions.Timeout:
-            if attempt < max_retries - 1:
-                print(f"⏱️ Timeout, nouvelle tentative {attempt + 2}/{max_retries}")
-                continue
-            raise HTTPException(
-                status_code=504,
-                detail="Timeout Hugging Face API"
-            )
-    
-    raise HTTPException(
-        status_code=500,
-        detail=f"Échec après {max_retries} tentatives"
-    )
-
-# ================== AUTRES FONCTIONS (IDENTIQUES À AVANT) ==================
+# ================== UTILS ==================
 
 def split_text(text, size=200):
-    """Découpe le texte en chunks (identique à avant)"""
     for i in range(0, len(text), size):
         yield text[i:i + size]
 
-# ================== MODELS (IDENTIQUES À AVANT) ==================
+def embed_text(text: str):
+    # Appel à Hugging Face au lieu de Groq
+    response = requests.post(
+        HF_API_URL,
+        headers={
+            "Authorization": f"Bearer {HF_TOKEN}",  # Format Hugging Face
+            "Content-Type": "application/json"
+        },
+        json={
+            "inputs": text,  # Hugging Face utilise "inputs" (avec 's')
+            "parameters": {
+                "truncation": True  # Important pour éviter les erreurs
+            }
+        },
+        timeout=30
+    )
+
+    if response.status_code != 200:
+        # Message d'erreur plus précis
+        error_detail = f"Hugging Face API error: {response.status_code}"
+        try:
+            error_detail += f" - {response.text[:100]}"
+        except:
+            pass
+        raise HTTPException(status_code=500, detail=error_detail)
+
+    # Format de réponse Hugging Face (différent de Groq/OpenAI)
+    data = response.json()
+    
+    # Hugging Face peut retourner différents formats
+    if isinstance(data, list):
+        if isinstance(data[0], list):
+            return data[0]  # Format [[embedding1, embedding2, ...]]
+        return data  # Format [embedding1, embedding2, ...]
+    elif isinstance(data, dict) and "embeddings" in data:
+        return data["embeddings"]
+    else:
+        # Format inattendu
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Format de réponse Hugging Face inattendu: {type(data)}"
+        )
+
+# ================== MODELS ==================
 
 class Question(BaseModel):
     question: str
 
-# ================== ENDPOINTS (IDENTIQUES À AVANT) ==================
+# ================== ENDPOINTS ==================
 
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
-    """Identique à votre ancien code, juste l'embedding change"""
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="PDF requis")
 
@@ -146,7 +102,7 @@ async def upload_pdf(file: UploadFile = File(...)):
             continue
 
         for chunk in split_text(text):
-            vector = embed_text(chunk)  # Utilise Hugging Face maintenant
+            vector = embed_text(chunk)
 
             qdrant.upsert(
                 collection_name=COLLECTION_NAME,
@@ -170,8 +126,7 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 @app.post("/ask")
 async def ask_question(data: Question):
-    """Identique à votre ancien code, juste l'embedding change"""
-    question_vector = embed_text(data.question)  # Utilise Hugging Face maintenant
+    question_vector = embed_text(data.question)
 
     results = qdrant.search(
         collection_name=COLLECTION_NAME,
@@ -190,45 +145,3 @@ async def ask_question(data: Question):
         "question": data.question,
         "contexts": contexts
     }
-
-@app.get("/")
-def root():
-    return {
-        "service": "RAG API",
-        "embedding": "Hugging Face",
-        "model": MODEL_NAME,
-        "vector_size": VECTOR_SIZE,
-        "collection": COLLECTION_NAME
-    }
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "qdrant": "active",
-        "embedding": "Hugging Face"
-    }
-
-# ================== MIDDLEWARE CORS ==================
-
-from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ================== DÉMARRAGE ==================
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    
-    print(f"🚀 Serveur démarré sur le port {port}")
-    print(f"📦 Modèle Hugging Face: {MODEL_NAME}")
-    print(f"🔢 Taille vecteurs: {VECTOR_SIZE}")
-    print(f"🗄️ Collection Qdrant: {COLLECTION_NAME}")
-    
-    uvicorn.run(app, host="0.0.0.0", port=port)
