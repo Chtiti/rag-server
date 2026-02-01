@@ -3,4 +3,5 @@ uvicorn
 qdrant-client
 pypdf
 requests
+pydantic
 python-multipart
