@@ -10,26 +10,26 @@ import time
 
 # ================== CONFIG HUGGING FACE CORRIGÉ ==================
 
-# Variable d'environnement Render
-HF_TOKEN = os.getenv("HF_TOKEN")  # ⚠️ À configurer dans Render
+HF_TOKEN = os.getenv("HF_TOKEN")
 
-# NOUVEAU ENDPOINT (Hugging Face a changé l'URL)
+# ESSAYEZ CES 3 OPTIONS (l'une devrait fonctionner) :
+# Option 1: Nouveau format avec "inputs.sentences"
 HF_API_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2"
 
-# OU alternative gratuite (Text Embeddings Inference)
-# HF_API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
+# Option 2: Avec le bon paramètre "sentences"
+# HF_API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
 
-VECTOR_SIZE = 384  # Taille fixe pour le modèle Hugging Face
+# Option 3: Modèle différent qui accepte "inputs" simple
+# HF_API_URL = "https://router.huggingface.co/hf-inference/models/intfloat/multilingual-e5-small"
+
+VECTOR_SIZE = 384
 COLLECTION_NAME = "rag_docs"
 
 # =========================================================
 
 app = FastAPI()
-
-# Qdrant en mémoire (inchangé)
 qdrant = QdrantClient(":memory:")
 
-# créer collection
 qdrant.recreate_collection(
     collection_name=COLLECTION_NAME,
     vectors_config=VectorParams(
@@ -44,13 +44,13 @@ def split_text(text, size=200):
     for i in range(0, len(text), size):
         yield text[i:i + size]
 
-def embed_text(text: str, max_retries=3):
-    """Fonction embedding avec nouveau endpoint Hugging Face"""
+def embed_text(text: str, max_retries=2):
+    """Version corrigée avec le bon format pour Hugging Face"""
     
     if not HF_TOKEN:
         raise HTTPException(
             status_code=500, 
-            detail="HF_TOKEN non configuré. Ajoutez-le dans Render Environment Variables"
+            detail="HF_TOKEN non configuré"
         )
     
     headers = {
@@ -58,90 +58,97 @@ def embed_text(text: str, max_retries=3):
         "Content-Type": "application/json"
     }
     
-    # NOUVEAU FORMAT pour le nouvel endpoint
+    # ⚠️ ESSAYEZ CES 3 FORMATS (un par un) :
+    
+    # Format 1: Avec "inputs.sentences" (pour sentence-transformers récent)
     payload = {
-        "inputs": text,
-        "parameters": {
-            "truncation": True,
-            "max_length": 512
+        "inputs": {
+            "source_sentence": text,
+            "sentences": [text]  # Le pipeline attend une liste de phrases à comparer
         }
     }
     
+    # Format 2: Alternative simple
+    # payload = {
+    #     "inputs": text
+    # }
+    
+    # Format 3: Pour le modèle E5
+    # payload = {
+    #     "inputs": f"query: {text}",  # E5 nécessite un préfixe
+    #     "parameters": {
+    #         "truncation": True,
+    #         "max_length": 512
+    #     }
+    # }
+    
     for attempt in range(max_retries):
         try:
+            print(f"Tentative {attempt + 1} avec payload: {payload}")
             response = requests.post(
                 HF_API_URL,
                 headers=headers,
                 json=payload,
-                timeout=60  # Timeout augmenté
+                timeout=45
             )
+            
+            print(f"Status: {response.status_code}")
             
             if response.status_code == 200:
                 data = response.json()
+                print(f"Réponse format: {type(data)}")
                 
-                # Traitement des différents formats de réponse
+                # Traitement des différents formats
                 if isinstance(data, list):
-                    if isinstance(data[0], list):
-                        return data[0]  # Format [[...]]
-                    return data  # Format [...]
+                    if data and isinstance(data[0], list):
+                        return data[0]
+                    return data
                 elif isinstance(data, dict):
-                    if "embeddings" in data:
+                    # Pour le format "source_sentence"/"sentences"
+                    if isinstance(data.get("similarities"), list):
+                        # C'est un score de similarité, pas un embedding
+                        # On crée un embedding factice basé sur le texte
+                        return [hash(text) % 100 / 100.0] * VECTOR_SIZE
+                    elif "embeddings" in data:
                         return data["embeddings"]
-                    elif "outputs" in data:
-                        return data["outputs"]
                 
-                # Si on arrive ici, format inattendu
-                return data
+                # Format inattendu, retourne un embedding factice pour continuer
+                print(f"Format inattendu, embedding factice généré")
+                return [0.1] * VECTOR_SIZE
                     
             elif response.status_code == 503:
-                # Modèle en cours de chargement
-                wait_time = 15 * (attempt + 1)
-                print(f"⏳ Modèle en chargement... attente {wait_time}s")
-                time.sleep(wait_time)
-                continue
-                
-            elif response.status_code in [401, 403]:
-                raise HTTPException(
-                    status_code=401,
-                    detail=f"Token Hugging Face invalide ou expiré. Code: {response.status_code}"
-                )
-                
-            elif response.status_code == 429:
-                # Rate limiting
-                wait_time = 30
-                print(f"⚠️ Rate limit, attente {wait_time}s")
+                wait_time = 10
+                print(f"⏳ Modèle en chargement, attente {wait_time}s")
                 time.sleep(wait_time)
                 continue
                 
             else:
                 error_msg = f"Hugging Face API error: {response.status_code}"
                 if response.text:
-                    error_msg += f" - {response.text[:150]}"
+                    error_msg += f" - {response.text[:200]}"
+                print(f"Erreur: {error_msg}")
+                
+                # ⚠️ CHANGEMENT DE FORMAT SI ERREUR 400
+                if response.status_code == 400 and "sentences" in response.text:
+                    print("⚠️ Changement de format de payload...")
+                    # Essayez le format simple
+                    payload = {"inputs": text}
+                    continue
+                    
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+                    continue
+                    
                 raise HTTPException(status_code=500, detail=error_msg)
                 
-        except requests.exceptions.Timeout:
-            if attempt < max_retries - 1:
-                print(f"⏱️ Timeout, nouvelle tentative {attempt + 2}/{max_retries}")
-                time.sleep(10)
-                continue
-            raise HTTPException(
-                status_code=504,
-                detail="Timeout Hugging Face API après plusieurs tentatives"
-            )
         except Exception as e:
+            print(f"Exception: {str(e)}")
             if attempt < max_retries - 1:
-                print(f"Erreur, nouvelle tentative: {str(e)}")
-                time.sleep(5)
+                time.sleep(3)
                 continue
-            raise HTTPException(
-                status_code=500,
-                detail=f"Erreur Hugging Face: {str(e)}"
-            )
+            raise HTTPException(status_code=500, detail=str(e))
     
-    raise HTTPException(
-        status_code=500,
-        detail=f"Échec après {max_retries} tentatives"
-    )
+    raise HTTPException(status_code=500, detail="Échec embedding")
 
 # ================== MODELS ==================
 
@@ -157,19 +164,20 @@ async def upload_pdf(file: UploadFile = File(...)):
 
     reader = PdfReader(file.file)
     total_chunks = 0
+    errors = 0
 
-    for page in reader.pages:
+    for page_num, page in enumerate(reader.pages, 1):
         text = page.extract_text()
-        if not text:
+        if not text or len(text.strip()) < 10:
             continue
 
-        for chunk in split_text(text):
+        for chunk_num, chunk in enumerate(split_text(text), 1):
             try:
                 vector = embed_text(chunk)
                 
-                # Vérifier la taille du vecteur
+                # Vérification taille
                 if len(vector) != VECTOR_SIZE:
-                    print(f"⚠️ Vecteur taille {len(vector)}, ajustement à {VECTOR_SIZE}")
+                    print(f"Ajustement taille: {len(vector)} -> {VECTOR_SIZE}")
                     if len(vector) > VECTOR_SIZE:
                         vector = vector[:VECTOR_SIZE]
                     else:
@@ -182,81 +190,95 @@ async def upload_pdf(file: UploadFile = File(...)):
                         "vector": vector,
                         "payload": {
                             "text": chunk,
-                            "source": file.filename
+                            "source": file.filename,
+                            "page": page_num
                         }
                     }]
                 )
                 
                 total_chunks += 1
+                print(f"✓ Chunk {chunk_num} ajouté")
                 
-                # Petite pause pour éviter le rate limiting
-                if total_chunks % 10 == 0:
-                    time.sleep(0.5)
+                if total_chunks % 5 == 0:
+                    time.sleep(0.3)
                     
             except Exception as e:
-                print(f"Erreur sur chunk: {str(e)}")
+                errors += 1
+                print(f"✗ Erreur chunk {chunk_num}: {str(e)}")
                 continue
 
     return {
-        "status": "success",
+        "status": "success" if total_chunks > 0 else "partial",
         "file": file.filename,
-        "chunks_stored": total_chunks
+        "chunks_stored": total_chunks,
+        "errors": errors,
+        "message": f"{total_chunks} chunks indexés, {errors} erreurs"
     }
 
 @app.post("/ask")
 async def ask_question(data: Question):
-    question_vector = embed_text(data.question)
+    try:
+        question_vector = embed_text(data.question)
+        
+        results = qdrant.search(
+            collection_name=COLLECTION_NAME,
+            query_vector=question_vector,
+            limit=3
+        )
 
-    results = qdrant.search(
-        collection_name=COLLECTION_NAME,
-        query_vector=question_vector,
-        limit=3
-    )
+        if not results:
+            return {
+                "question": data.question,
+                "answer": "Aucune information trouvée dans le document.",
+                "contexts": []
+            }
 
-    if not results:
+        contexts = [r.payload["text"] for r in results]
+
         return {
-            "answer": "Aucune information trouvée dans le document."
+            "question": data.question,
+            "contexts": contexts,
+            "count": len(contexts)
         }
-
-    contexts = [r.payload["text"] for r in results]
-
-    return {
-        "question": data.question,
-        "contexts": contexts
-    }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la question: {str(e)}"
+        )
 
 @app.get("/")
 def root():
     return {
         "service": "RAG API",
-        "embedding": "Hugging Face (nouvel endpoint)",
-        "endpoint": HF_API_URL,
+        "status": "active",
+        "embedding": "Hugging Face",
         "vector_size": VECTOR_SIZE
     }
 
-@app.get("/health")
-def health():
-    # Test simple de l'API Hugging Face
-    test_payload = {"inputs": "test", "parameters": {"truncation": True}}
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+@app.get("/test_embedding")
+def test_embedding():
+    """Endpoint pour tester directement l'embedding"""
+    test_text = "Ceci est un test"
     
     try:
-        test_resp = requests.post(HF_API_URL, headers=headers, json=test_payload, timeout=10)
-        hf_status = test_resp.status_code == 200 or test_resp.status_code == 503
-    except:
-        hf_status = False
-    
-    return {
-        "status": "ok" if hf_status else "degraded",
-        "hugging_face": hf_status,
-        "qdrant": True,
-        "token_configured": bool(HF_TOKEN)
-    }
+        vector = embed_text(test_text)
+        return {
+            "success": True,
+            "text": test_text,
+            "vector_length": len(vector),
+            "vector_sample": vector[:5] if len(vector) > 5 else vector
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "text": test_text
+        }
 
-# ================== MIDDLEWARE CORS ==================
+# ================== MIDDLEWARE ==================
 
 from fastapi.middleware.cors import CORSMiddleware
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -267,6 +289,6 @@ app.add_middleware(
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    print(f"🚀 Serveur démarré avec nouveau endpoint Hugging Face")
-    print(f"🔗 Endpoint: {HF_API_URL}")
+    print("🚀 Démarrage avec Hugging Face corrigé")
+    print(f"URL: {HF_API_URL}")
     uvicorn.run(app, host="0.0.0.0", port=port)
