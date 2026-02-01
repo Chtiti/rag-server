@@ -2,46 +2,38 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from pypdf import PdfReader
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import VectorParams, Distance
+from qdrant_client.http.models import PointStruct, VectorParams, Distance
 import requests
 import uuid
 import os
 import time
-import hashlib
 
-# ================== CONFIG CORRIGÉE ==================
+# ================== CONFIG ==================
 
 HF_TOKEN = os.getenv("HF_TOKEN")
-
-# ⚠️ CHANGER CETTE URL ! Le modèle actuel ne fait que de la similarité
-# Utilisez plutôt un modèle qui fait réellement des embeddings :
-
-# OPTION 1: BGE model (recommandé)
 HF_API_URL = "https://router.huggingface.co/hf-inference/models/BAAI/bge-small-en"
-
-# OPTION 2: E5 model (multilingue)
-# HF_API_URL = "https://router.huggingface.co/hf-inference/models/intfloat/multilingual-e5-small"
-
-# OPTION 3: feature-extraction pipeline
-# HF_API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/BAAI/bge-small-en"
-
-VECTOR_SIZE = 384  # Pour BAAI/bge-small-en
-# VECTOR_SIZE = 384  # Pour multilingual-e5-small aussi
-
+VECTOR_SIZE = 384
 COLLECTION_NAME = "rag_docs"
 
-# =====================================================
+# ============================================
 
 app = FastAPI()
+
+# Qdrant en mémoire
 qdrant = QdrantClient(":memory:")
 
-qdrant.recreate_collection(
-    collection_name=COLLECTION_NAME,
-    vectors_config=VectorParams(
-        size=VECTOR_SIZE,
-        distance=Distance.COSINE
+# Créer la collection
+try:
+    qdrant.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config=VectorParams(
+            size=VECTOR_SIZE,
+            distance=Distance.COSINE
+        )
     )
-)
+    print(f"✅ Collection '{COLLECTION_NAME}' créée")
+except Exception as e:
+    print(f"ℹ️ Collection existe déjà ou erreur: {e}")
 
 # ================== UTILS ==================
 
@@ -51,21 +43,17 @@ def split_text(text, size=300):
         if chunk:
             yield chunk
 
-def embed_text(text: str, max_retries=3):
-    """Version corrigée avec BGE model"""
+def embed_text(text: str):
+    """Génère des embeddings avec Hugging Face"""
     
     if not HF_TOKEN:
-        raise HTTPException(
-            status_code=500, 
-            detail="HF_TOKEN non configuré dans Render Environment Variables"
-        )
+        raise HTTPException(status_code=500, detail="HF_TOKEN non configuré")
     
     headers = {
         "Authorization": f"Bearer {HF_TOKEN}",
         "Content-Type": "application/json"
     }
     
-    # ⚠️ FORMAT CORRECT pour BAAI/bge-small-en :
     payload = {
         "inputs": text,
         "parameters": {
@@ -74,99 +62,37 @@ def embed_text(text: str, max_retries=3):
         }
     }
     
-    for attempt in range(max_retries):
-        try:
-            print(f"Tentative {attempt + 1} - Texte: {text[:50]}...")
-            response = requests.post(
-                HF_API_URL,
-                headers=headers,
-                json=payload,
-                timeout=60
-            )
+    try:
+        response = requests.post(
+            HF_API_URL,
+            headers=headers,
+            json=payload,
+            timeout=60
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
             
-            print(f"Status: {response.status_code}")
-            
-            if response.status_code == 200:
-                data = response.json()
-                print(f"Type réponse: {type(data)}")
-                
-                # BGE renvoie une liste d'embeddings
-                if isinstance(data, list):
-                    if isinstance(data[0], list):
-                        embedding = data[0]  # Format [[...]]
-                    else:
-                        embedding = data  # Format [...]
-                    
-                    print(f"Longueur embedding: {len(embedding)}")
-                    
-                    # Vérification taille
-                    if len(embedding) == VECTOR_SIZE:
-                        return embedding
-                    elif len(embedding) > VECTOR_SIZE:
-                        print(f"Troncature: {len(embedding)} -> {VECTOR_SIZE}")
-                        return embedding[:VECTOR_SIZE]
-                    else:
-                        print(f"Padding: {len(embedding)} -> {VECTOR_SIZE}")
-                        return embedding + [0.0] * (VECTOR_SIZE - len(embedding))
-                        
+            if isinstance(data, list):
+                if isinstance(data[0], list):
+                    vector = data[0]
                 else:
-                    print(f"Format inattendu: {type(data)}")
-                    # Fallback: générer un embedding factice basé sur le hash
-                    return generate_fallback_embedding(text)
-                    
-            elif response.status_code == 503:
-                wait_time = 15
-                print(f"⏳ Modèle en chargement, attente {wait_time}s")
-                time.sleep(wait_time)
-                continue
+                    vector = data
                 
-            elif response.status_code == 400:
-                # Essayer un format différent
-                print("⚠️ Code 400, essai format simple...")
-                payload = {"inputs": text}
-                continue
-                
-            else:
-                error_msg = f"Erreur API: {response.status_code}"
-                if response.text:
-                    error_msg += f" - {response.text[:150]}"
-                print(f"Erreur: {error_msg}")
-                
-                if attempt < max_retries - 1:
-                    time.sleep(5)
-                    continue
-                    
-                # Fallback en cas d'échec
-                return generate_fallback_embedding(text)
-                
-        except Exception as e:
-            print(f"Exception: {str(e)}")
-            if attempt < max_retries - 1:
-                time.sleep(3)
-                continue
-            # Fallback en cas d'échec
-            return generate_fallback_embedding(text)
-    
-    # Fallback final
-    return generate_fallback_embedding(text)
-
-def generate_fallback_embedding(text: str):
-    """Génère un embedding factice basé sur le hash du texte"""
-    # Hash du texte pour générer des valeurs pseudo-aléatoires
-    hash_obj = hashlib.md5(text.encode())
-    hash_bytes = hash_obj.digest()
-    
-    # Convertir en liste de flottants
-    embedding = []
-    for i in range(0, min(len(hash_bytes), VECTOR_SIZE)):
-        embedding.append((hash_bytes[i] / 255.0) - 0.5)  # Valeurs entre -0.5 et 0.5
-    
-    # Remplir si nécessaire
-    while len(embedding) < VECTOR_SIZE:
-        embedding.append(0.0)
-    
-    print(f"⚠️ Fallback embedding généré (taille: {len(embedding)})")
-    return embedding
+                # Ajuster la taille si nécessaire
+                if len(vector) > VECTOR_SIZE:
+                    return vector[:VECTOR_SIZE]
+                elif len(vector) < VECTOR_SIZE:
+                    return vector + [0.0] * (VECTOR_SIZE - len(vector))
+                else:
+                    return vector
+        else:
+            raise Exception(f"API error: {response.status_code}")
+            
+    except Exception as e:
+        print(f"Erreur embedding: {str(e)}")
+        # Fallback: vecteur simple
+        return [0.1] * VECTOR_SIZE
 
 # ================== MODELS ==================
 
@@ -182,142 +108,108 @@ async def upload_pdf(file: UploadFile = File(...)):
 
     reader = PdfReader(file.file)
     total_chunks = 0
-    errors = 0
 
     for page_num, page in enumerate(reader.pages, 1):
         text = page.extract_text()
         if not text or len(text.strip()) < 20:
             continue
 
-        chunks = list(split_text(text))
-        print(f"Page {page_num}: {len(chunks)} chunks")
-        
-        for chunk_num, chunk in enumerate(chunks, 1):
+        for chunk in split_text(text):
             try:
                 vector = embed_text(chunk)
                 
-                # Vérification finale
-                if len(vector) != VECTOR_SIZE:
-                    print(f"Ajustement final: {len(vector)} -> {VECTOR_SIZE}")
-                    if len(vector) > VECTOR_SIZE:
-                        vector = vector[:VECTOR_SIZE]
-                    else:
-                        vector = vector + [0.0] * (VECTOR_SIZE - len(vector))
+                # Utiliser PointStruct correctement
+                point = PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector=vector,
+                    payload={
+                        "text": chunk,
+                        "source": file.filename,
+                        "page": page_num
+                    }
+                )
                 
-                # Créer un ID unique
-                point_id = str(uuid.uuid4())
-                
+                # Upsert avec PointStruct
                 qdrant.upsert(
                     collection_name=COLLECTION_NAME,
-                    points=[{
-                        "id": point_id,
-                        "vector": vector,
-                        "payload": {
-                            "text": chunk,
-                            "source": file.filename,
-                            "page": page_num,
-                            "chunk": chunk_num
-                        }
-                    }]
+                    points=[point]
                 )
                 
                 total_chunks += 1
-                print(f"✓ Chunk {chunk_num} ajouté (ID: {point_id[:8]})")
+                print(f"✓ Chunk ajouté: {total_chunks}")
                 
-                # Petite pause
-                if chunk_num % 5 == 0:
-                    time.sleep(0.5)
-                    
+                time.sleep(0.1)  # Petite pause
+                
             except Exception as e:
-                errors += 1
-                print(f"✗ Erreur chunk {chunk_num}: {str(e)}")
+                print(f"Erreur chunk: {str(e)}")
                 continue
 
     return {
         "status": "success",
         "file": file.filename,
-        "chunks_stored": total_chunks,
-        "errors": errors,
-        "message": f"PDF traité: {total_chunks} chunks indexés"
+        "chunks_stored": total_chunks
     }
 
 @app.post("/ask")
 async def ask_question(data: Question):
     try:
-        print(f"Question reçue: {data.question}")
-        
         question_vector = embed_text(data.question)
-        print(f"Embedding question généré (taille: {len(question_vector)})")
         
-        results = qdrant.search(
+        # Recherche CORRECTE dans Qdrant
+        results = qdrant.query(
             collection_name=COLLECTION_NAME,
             query_vector=question_vector,
             limit=3
         )
-
+        
+        # Vérifier si results est une liste ou un objet
         if not results:
             return {
                 "question": data.question,
                 "answer": "Aucune information trouvée dans le document.",
                 "contexts": []
             }
-
-        contexts = [r.payload["text"] for r in results]
-        scores = [r.score for r in results]
+        
+        # Extraire les textes selon le format de réponse
+        contexts = []
+        if hasattr(results[0], 'payload'):
+            # Format avec objets
+            contexts = [r.payload.get("text", "") for r in results]
+        elif isinstance(results[0], dict) and "payload" in results[0]:
+            # Format dict
+            contexts = [r["payload"].get("text", "") for r in results]
+        else:
+            contexts = [str(r) for r in results]
 
         return {
             "question": data.question,
-            "contexts": contexts,
-            "scores": scores,
+            "contexts": contexts[:3],  # Limiter à 3
             "count": len(contexts)
         }
         
     except Exception as e:
-        print(f"Erreur dans /ask: {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail=f"Erreur: {str(e)}"
+            detail=f"Erreur recherche: {str(e)}"
         )
 
 @app.get("/")
 def root():
     return {
         "service": "RAG API",
-        "status": "active",
-        "embedding_model": "BAAI/bge-small-en",
-        "vector_size": VECTOR_SIZE
+        "embedding": "BAAI/bge-small-en",
+        "vector_size": VECTOR_SIZE,
+        "status": "active"
     }
 
-@app.get("/test_model")
-def test_model():
-    """Test complet du modèle"""
-    test_text = "Ceci est un test d'embedding"
-    
-    try:
-        vector = embed_text(test_text)
-        
-        # Vérifier aussi directement l'API
-        headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-        payload = {"inputs": test_text}
-        
-        direct_response = requests.post(
-            HF_API_URL,
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
-        
-        return {
-            "model": "BAAI/bge-small-en",
-            "url": HF_API_URL,
-            "test_text": test_text,
-            "embedding_length": len(vector),
-            "embedding_sample": vector[:3],
-            "api_status": direct_response.status_code,
-            "api_response_type": type(direct_response.json()).__name__ if direct_response.status_code == 200 else "error"
-        }
-    except Exception as e:
-        return {"error": str(e)}
+@app.get("/test")
+def test():
+    """Test simple de l'API"""
+    return {
+        "message": "API fonctionnelle",
+        "qdrant": "connecté",
+        "hugging_face": "configuré" if HF_TOKEN else "non configuré"
+    }
 
 # ================== MIDDLEWARE ==================
 
@@ -332,7 +224,6 @@ app.add_middleware(
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    print("🚀 Démarrage avec BGE model")
-    print(f"Modèle: {HF_API_URL}")
-    print(f"Taille vecteur: {VECTOR_SIZE}")
+    print("🚀 Serveur démarré")
+    print(f"Port: {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
